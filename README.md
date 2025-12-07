@@ -1,6 +1,9 @@
 # Multimodal Foundation Model Architecture Research
 
-**CentraleSupélec | Sep 2025 – Apr 2026** *Supervised by Dr. Zhiguo Zeng*
+### CentraleSupélec | Sep 2025 – Apr 2026
+**Supervised by Dr. Zhiguo Zeng**
+
+---
 
 ## Project Highlights
 * **Novel Architecture Design:** Designing a transformer-based multimodal architecture for Text, Audio, and Time-series data, directly applicable to **robotic perception and state estimation**.
@@ -11,6 +14,9 @@
 ---
 
 ## Project Structure
-* `scripts/`: Training and testing scripts for the CWRU dataset.
-* `momentfm/`: Core architecture and model definitions.
-* `checkpoints/`: Model weights and training states.
+This repository contains the implementation and research scripts:
+
+* `momentfm/`: Core architecture and model definitions (Foundation Model).
+* `scripts/`: Custom training and testing scripts developed for the CWRU dataset.
+* `data/`: Dataset configurations and data loading utilities.
+* `checkpoints/`: *[Local Only]* Directory where model weights and training states are saved during execution.
