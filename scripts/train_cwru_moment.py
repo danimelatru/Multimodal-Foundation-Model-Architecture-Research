@@ -22,16 +22,16 @@ SEED = 42
 # 1. Load dataset
 # -----------------------------------------------------
 print("[INFO] Loading CWRU dataset...")
-config = Namespace(
+data_config = Namespace(
     base_path="/gpfs/workdir/fernandeda/projects/CWRU_Dataset",
     cache_dir="/gpfs/workdir/fernandeda/projects/moment/data/cache",
     window=1024,
     stride=512,
     seq_len=1024,
     task_name=TASKS.CLASSIFICATION,
-    load_cache=False,
+    load_cache=True,
 )
-dataset = CWRU_dataset(config)
+dataset = CWRU_dataset(data_config)
 
 print("Unique labels:", np.unique(dataset.labels))
 print("Number of classes declared:", dataset.num_classes)
@@ -56,17 +56,19 @@ train_dataset, val_dataset = random_split(
     trainval_dataset, [inner_train_size, val_size], generator=g
 )
 
-print(f"[INFO] Dataset sizes -> Total: {total_len}, "
-      f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+print(
+    f"[INFO] Dataset sizes -> Total: {total_len}, "
+    f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}"
+)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # -----------------------------------------------------
-# 2. Configure and initialize MOMENT model
+# 2. Configure and initialize MOMENT model (PRETRAINED + FULL FT)
 # -----------------------------------------------------
-config = Namespace(
+model_config = Namespace(
     task_name=TASKS.CLASSIFICATION,
     n_channels=1,
     num_class=dataset.num_classes,
@@ -77,11 +79,22 @@ config = Namespace(
     transformer_backbone="google/flan-t5-small",
     transformer_type="encoder_only",
     t5_config={"d_model": 256, "num_layers": 4, "num_heads": 8, "d_ff": 512},
+
+    # Use pretrained backbone
+    randomly_initialize_backbone=False,
+
+    # full fine-tuning
+    freeze_embedder=False,
+    freeze_encoder=False,
+    freeze_head=False,
+
+    # to save memory
+    enable_gradient_checkpointing=True,
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Device being used: {device}")
-model = MOMENT(config).to(device)
+model = MOMENT(model_config).to(device)
 print(f"[INFO] Model initialized on {device}. Num classes: {dataset.num_classes}")
 
 if torch.cuda.is_available():
@@ -90,23 +103,9 @@ if torch.cuda.is_available():
         _ = model.classify(x_enc=dummy)
     print(f"[DEBUG] ✅ Forward pass successful on {torch.cuda.get_device_name(0)}")
 
-# -----------------------------------------------------
-# 3. Optionally freeze encoder
-# -----------------------------------------------------
-freeze_encoder = False
-if freeze_encoder:
-    for name, param in model.named_parameters():
-        if not any(k in name.lower() for k in ["head", "classifier", "output"]):
-            param.requires_grad = False
-    print("[INFO] Encoder frozen; training head parameters only.")
-else:
-    print("[INFO] Full fine-tuning (encoder + classification head).")
-
-# Debug: list trainable params
-trainable_params = [n for n, p in model.named_parameters() if p.requires_grad]
-print(f"[DEBUG] Trainable parameters: {len(trainable_params)}")
-for n in trainable_params:
-    print("   ->", n)
+# Debug: how many params are actually trainable
+n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"[INFO] Trainable parameters: {n_trainable}")
 
 # -----------------------------------------------------
 # 4. Training setup
@@ -122,12 +121,13 @@ scaler = GradScaler(enabled=use_amp)
 CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-checkpoint_path = os.path.join(CHECKPOINT_DIR, "moment_cwru_final.pt")
+checkpoint_path = os.path.join(CHECKPOINT_DIR, "moment_cwru_pretrained.pt")
 
 if os.path.exists(checkpoint_path):
     print(f"[INFO] Loading checkpoint from {checkpoint_path}")
     state_dict = torch.load(checkpoint_path, map_location=device)
 
+    # If the head shape changed (e.g. num_classes), drop old head params
     for key in list(state_dict.keys()):
         if key.startswith("head.linear."):
             print(f"[INFO] Dropping head parameter from checkpoint: {key}")
@@ -137,7 +137,7 @@ if os.path.exists(checkpoint_path):
     print(f"[INFO] Loaded checkpoint with missing keys: {missing}")
     print(f"[INFO] Loaded checkpoint with unexpected keys: {unexpected}")
 else:
-    print("[INFO] No checkpoint found, training from scratch.")
+    print("[INFO] No checkpoint found, training from scratch (pretrained backbone only).")
 
 # -----------------------------------------------------
 # 5. Training + Validation + Test
@@ -216,10 +216,10 @@ for epoch in range(EPOCHS):
         print(f"[INFO] 🧩 Test Accuracy after {epoch+1} epochs: {test_acc:.2f}%")
 
         torch.save(model.state_dict(), checkpoint_path)
-        print(f"[INFO] ✅ Checkpoint saved at epoch {epoch+1}")
+        print(f"[INFO] ✅ Checkpoint (pretrained FT) saved at epoch {epoch+1}")
 
 # -----------------------------------------------------
 # 6. Final save
 # -----------------------------------------------------
 torch.save(model.state_dict(), checkpoint_path)
-print(f"[INFO] 🧠 Final model saved in {checkpoint_path} ✅")
+print(f"[INFO] 🧠 Final (pretrained FT) model saved in {checkpoint_path} ✅")
