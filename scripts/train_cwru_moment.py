@@ -15,7 +15,7 @@ from torch.cuda.amp import GradScaler, autocast
 # 0. Hyperparameters
 # -----------------------------------------------------
 BATCH_SIZE = 32
-EPOCHS = 20
+EPOCHS = 40
 SEED = 42
 
 # -----------------------------------------------------
@@ -36,7 +36,7 @@ dataset = CWRU_dataset(data_config)
 print("Unique labels:", np.unique(dataset.labels))
 print("Number of classes declared:", dataset.num_classes)
 
-# Reproducible splits
+# Reproducible splits (partition by file)
 g = torch.Generator().manual_seed(SEED)
 
 # 85% train+val, 15% test
@@ -44,17 +44,14 @@ total_len = len(dataset)
 trainval_size = int(0.85 * total_len)
 test_size = total_len - trainval_size
 
-trainval_dataset, test_dataset = random_split(
-    dataset, [trainval_size, test_size], generator=g
-)
+# Ensure splits are done by file (not by window)
+trainval_dataset, test_dataset = random_split(dataset, [trainval_size, test_size], generator=g)
 
 # Of the 85% train+val: 85% train, 15% val
 inner_train_size = int(0.85 * trainval_size)
 val_size = trainval_size - inner_train_size
 
-train_dataset, val_dataset = random_split(
-    trainval_dataset, [inner_train_size, val_size], generator=g
-)
+train_dataset, val_dataset = random_split(trainval_dataset, [inner_train_size, val_size], generator=g)
 
 print(
     f"[INFO] Dataset sizes -> Total: {total_len}, "
@@ -108,7 +105,7 @@ n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"[INFO] Trainable parameters: {n_trainable}")
 
 # -----------------------------------------------------
-# 4. Training setup
+# 3. Training setup
 # -----------------------------------------------------
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
@@ -121,7 +118,7 @@ scaler = GradScaler(enabled=use_amp)
 CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-checkpoint_path = os.path.join(CHECKPOINT_DIR, "moment_cwru_pretrained.pt")
+checkpoint_path = os.path.join(CHECKPOINT_DIR, "moment_cwru_finetuned.pt")
 
 if os.path.exists(checkpoint_path):
     print(f"[INFO] Loading checkpoint from {checkpoint_path}")
@@ -137,10 +134,10 @@ if os.path.exists(checkpoint_path):
     print(f"[INFO] Loaded checkpoint with missing keys: {missing}")
     print(f"[INFO] Loaded checkpoint with unexpected keys: {unexpected}")
 else:
-    print("[INFO] No checkpoint found, training from scratch (pretrained backbone only).")
+    print("[INFO] No checkpoint found, training (fine-tuning) from Moment's pretrained backbone.")
 
 # -----------------------------------------------------
-# 5. Training + Validation + Test
+# 4. Training + Validation + Test
 # -----------------------------------------------------
 for epoch in range(EPOCHS):
     # ------- TRAIN -------
@@ -172,7 +169,7 @@ for epoch in range(EPOCHS):
     avg_train_loss = total_loss / len(train_loader)
     current_lr = scheduler.get_last_lr()[0]
 
-    # ------- VALIDATION -------
+    # ------- VALIDATION (EVALUATE AFTER ALL EPOCHS) -------
     model.eval()
     val_loss_total = 0.0
     val_correct, val_total = 0, 0
@@ -200,8 +197,8 @@ for epoch in range(EPOCHS):
         f"LR={current_lr:.6f}"
     )
 
-    # ------- PERIODIC TEST EVAL + CHECKPOINT -------
-    if (epoch + 1) % 5 == 0:
+    # ------- TEST EVALUATION AFTER ALL EPOCHS -------
+    if epoch == EPOCHS - 1:
         test_correct, test_total = 0, 0
         with torch.no_grad():
             for X, y in test_loader:
@@ -213,13 +210,14 @@ for epoch in range(EPOCHS):
                 test_total += y.size(0)
 
         test_acc = 100.0 * test_correct / test_total
-        print(f"[INFO] 🧩 Test Accuracy after {epoch+1} epochs: {test_acc:.2f}%")
+        print(f"[INFO] 🧩 Final Test Accuracy: {test_acc:.2f}%")
 
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"[INFO] ✅ Checkpoint (pretrained FT) saved at epoch {epoch+1}")
+    # ------- SAVE CHECKPOINT -------
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"[INFO] ✅ Checkpoint (pretrained FT) saved at epoch {epoch+1}")
 
 # -----------------------------------------------------
-# 6. Final save
+# 5. Final save
 # -----------------------------------------------------
 torch.save(model.state_dict(), checkpoint_path)
 print(f"[INFO] 🧠 Final (pretrained FT) model saved in {checkpoint_path} ✅")

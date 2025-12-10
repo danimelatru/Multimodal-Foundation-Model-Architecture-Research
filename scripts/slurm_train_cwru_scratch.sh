@@ -8,6 +8,7 @@
 #SBATCH --mem=32G
 #SBATCH --partition=gpua100
 #SBATCH --gres=gpu:1
+#SBATCH --exclude=ruche-gpu11,ruche-gpu16,ruche-gpu17,ruche-gpu19
 
 module purge
 

@@ -105,7 +105,7 @@ CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 checkpoint_path = os.path.join(CHECKPOINT_DIR, "moment_cwru_scratch.pt")
 
-print("[INFO] Training from scratch (no checkpoint loaded).")
+print("[INFO] No checkpoint loaded: Training (Pre-training) from scratch (Moment's backbone without updated pretrained weights).")
 
 # -----------------------------------------------------
 # 4. Training + Validation + Test
@@ -140,7 +140,7 @@ for epoch in range(EPOCHS):
     avg_train_loss = total_loss / len(train_loader)
     current_lr = scheduler.get_last_lr()[0]
 
-    # ------- VALIDATION -------
+    # ------- VALIDATION (EVALUATE AFTER ALL EPOCHS) -------
     model.eval()
     val_loss_total = 0.0
     val_correct, val_total = 0, 0
@@ -168,8 +168,8 @@ for epoch in range(EPOCHS):
         f"LR={current_lr:.6f}"
     )
 
-    # ------- PERIODIC TEST EVAL + CHECKPOINT -------
-    if (epoch + 1) % 5 == 0:
+    # ------- TEST EVALUATION AFTER ALL EPOCHS -------
+    if epoch == EPOCHS - 1:
         test_correct, test_total = 0, 0
         with torch.no_grad():
             for X, y in test_loader:
@@ -181,13 +181,14 @@ for epoch in range(EPOCHS):
                 test_total += y.size(0)
 
         test_acc = 100.0 * test_correct / test_total
-        print(f"[INFO] 🧩 Test Accuracy after {epoch+1} epochs: {test_acc:.2f}%")
+        print(f"[INFO] 🧩 Final Test Accuracy: {test_acc:.2f}%")
 
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"[INFO] ✅ Checkpoint (scratch) saved at epoch {epoch+1}")
+    # ------- SAVE CHECKPOINT -------
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"[INFO] ✅ Checkpoint (scratch) saved at epoch {epoch+1}")
 
 # -----------------------------------------------------
 # 5. Final save
 # -----------------------------------------------------
 torch.save(model.state_dict(), checkpoint_path)
-print(f"[INFO] 🧠 Final (scratch) model saved in {checkpoint_path} ✅")
+print(f"[INFO] 🧠 Final (pretrained FT) model saved in {checkpoint_path} ✅")
