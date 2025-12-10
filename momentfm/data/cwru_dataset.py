@@ -90,13 +90,14 @@ class CWRU_dataset(Dataset):
 
                 # Handle OR###@##_##.mat pattern (e.g. OR007@12_0.mat)
                 elif file.startswith("OR"):
-                    # Capture 'OR' separately from the digits so we map all to the same 'OR' class
-                    m = re.match(r'(OR)(\d+)@(\d+)_([0-3])\.mat', file)
+                    # Use original working pattern and then collapse to single "OR" class
+                    m = re.match(r'(OR\d+)@(\d+)_([0-3])\.mat', file)
                     if not m:
                         print(f"Skipping {file}: unrecognized OR pattern")
                         continue
-                    fault, size, speed, load = m.groups()
-                    # 'fault' is now literally "OR" → maps to label_map["OR"]
+                    fault_full, speed, load = m.groups()
+                    # Collapse all OR### variants into a single "OR" class
+                    fault = "OR"
 
                 # Handle legacy faulted pattern like B007_1.mat, IR014_3.mat, OR007_2.mat, etc.
                 else:
@@ -122,6 +123,12 @@ class CWRU_dataset(Dataset):
                     X.append(w)
                     y.append(label)
                     loads.append(int(load))
+
+        if len(X) == 0:
+            raise RuntimeError(
+                f"No windows built from base_path={self.base_path}. "
+                f"Check that the folder exists and contains .mat files with valid names."
+            )
 
         return np.stack(X), np.array(y), np.array(loads)
 

@@ -1,8 +1,8 @@
 from momentfm.data import CWRU_dataset
 
 class Config:
-    base_path = "/home/fernandeda/projects/CWRU_Dataset"
-    cache_dir = "/home/fernandeda/projects/moment/data/cache"
+    base_path="/gpfs/workdir/fernandeda/projects/CWRU_Dataset"
+    cache_dir="/gpfs/workdir/fernandeda/projects/moment/data/cache"
     seq_len = 1024
     window = 1024
     stride = 512

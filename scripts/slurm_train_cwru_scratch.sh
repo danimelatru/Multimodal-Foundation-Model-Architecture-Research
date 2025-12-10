@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=train_cwru
-#SBATCH --output=logs/train_cwru_%j.out
-#SBATCH --error=logs/train_cwru_%j.err
-#SBATCH --time=2:00:00
+#SBATCH --job-name=train_cwru_scratch
+#SBATCH --output=logs/train_cwru_scratch_%j.out
+#SBATCH --error=logs/train_cwru_scratch_%j.err
+#SBATCH --time=4:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 #SBATCH --partition=gpua100
 #SBATCH --gres=gpu:1
 
@@ -21,4 +21,4 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 cd "$PROJECT_ROOT"
 
-python -u scripts/train_cwru_moment.py
+python -u scripts/train_cwru_moment_scratch.py
