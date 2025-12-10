@@ -59,6 +59,8 @@ reference_docs/
 # =========================
 logs/
 *.log
+*.out
+*.err
 slurm-*.out
 slurm-*.err
 
