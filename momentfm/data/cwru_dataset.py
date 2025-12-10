@@ -32,7 +32,9 @@ class CWRU_dataset(Dataset):
         self.window = getattr(config, "window", 1024)
         self.stride = getattr(config, "stride", 512)
 
+        # FIXED 4-CLASS LABEL MAP
         self.label_map = {"Normal": 0, "B": 1, "IR": 2, "OR": 3}
+
         cache_path = os.path.join(self.cache_dir, f"cwru_{phase}.pkl")
         make_dir_if_not_exists(self.cache_dir)
 
@@ -56,6 +58,8 @@ class CWRU_dataset(Dataset):
         self._timeseries = self._timeseries.reshape(n_samples, 1, self.seq_len)
 
         self._length = len(self._timeseries)
+
+        # Make labels contiguous (0..n_classes-1) but still only from the 4 base classes
         unique_labels = np.unique(self._labels)
         label_mapping = {old: new for new, old in enumerate(unique_labels)}
         self._labels = np.array([label_mapping[l] for l in self._labels])
@@ -63,7 +67,6 @@ class CWRU_dataset(Dataset):
         self.num_classes = self.n_classes
         print(f"[INFO] Loaded {self._length} windows, {self.n_classes} contiguous classes.")
         print(f"[DEBUG] Label mapping used: {label_mapping}")
-
 
     # ----------------------------------------------------------------------
     def _build_dataset(self):
@@ -81,34 +84,36 @@ class CWRU_dataset(Dataset):
                     if not m:
                         print(f"Skipping {file}: unrecognized normal pattern")
                         continue
-                    fault, load = "Normal", m.group(1)
+                    fault = "Normal"
+                    load = m.group(1)
                     size = None
 
                 # Handle OR###@##_##.mat pattern (e.g. OR007@12_0.mat)
                 elif file.startswith("OR"):
-                    m = re.match(r'(OR\d+)@(\d+)_([0-3])\.mat', file)
+                    # Capture 'OR' separately from the digits so we map all to the same 'OR' class
+                    m = re.match(r'(OR)(\d+)@(\d+)_([0-3])\.mat', file)
                     if not m:
                         print(f"Skipping {file}: unrecognized OR pattern")
                         continue
-                    fault, size, load = m.groups()
+                    fault, size, speed, load = m.groups()
+                    # 'fault' is now literally "OR" → maps to label_map["OR"]
 
-                # Handle legacy faulted pattern like B007_1.mat, IR014_3.mat, etc.
+                # Handle legacy faulted pattern like B007_1.mat, IR014_3.mat, OR007_2.mat, etc.
                 else:
                     m = re.match(r'([A-Z]+)(\d+)_([0-3])\.mat', file)
                     if not m:
                         print(f"Skipping {file}: unrecognized pattern")
                         continue
                     fault, size, load = m.groups()
+                    # Here 'fault' will be 'B', 'IR', 'OR', etc.
 
-                label_name = fault
+                label_name = fault  # e.g. "Normal", "B", "IR", "OR"
                 label = self.label_map.get(label_name, None)
+
+                # STRICT: ONLY KEEP THE 4 BASE CLASSES
                 if label is None:
-                    # For new OR files, add them dynamically if needed
-                    if fault not in self.label_map:
-                        self.label_map[fault] = len(self.label_map)
-                        label = self.label_map[fault]
-                    else:
-                        continue
+                    print(f"Skipping {file}: fault type {label_name} not in base label_map")
+                    continue
 
                 # Load signal and create windows
                 full_path = os.path.join(root, file)
@@ -119,8 +124,6 @@ class CWRU_dataset(Dataset):
                     loads.append(int(load))
 
         return np.stack(X), np.array(y), np.array(loads)
-
-
 
     # ----------------------------------------------------------------------
     def __len__(self):

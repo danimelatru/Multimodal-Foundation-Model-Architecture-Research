@@ -7,11 +7,14 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --partition=gpua100
-#SBATCH --gres=gpu:1 
+#SBATCH --gres=gpu:1
 
-module load python/3.9.10/gcc-11.2.0
-source ~/moment_env_py39/bin/activate
+module purge
+
+source ~/.bashrc
+
+conda activate moment_env_py39
+
 cd ~/projects/moment
 
-python train_cwru_moment.py
-
+python -u train_cwru_moment.py
