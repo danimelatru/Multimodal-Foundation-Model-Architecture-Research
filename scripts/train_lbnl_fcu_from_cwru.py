@@ -1,102 +1,105 @@
-# train_lbnl_fcu_from_cwru.py
-
 import os
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 from torch import nn, optim
 from torch.cuda.amp import GradScaler, autocast
 from argparse import Namespace
+from sklearn.metrics import confusion_matrix, classification_report
 
 from momentfm.data.lbnl_fcu_dataset import LBNL_FCU_Dataset
 from momentfm.models.moment import MOMENT
 from momentfm.common import TASKS
 
+plt.switch_backend('Agg')
 
 # -----------------------------------------------------
 # 0. Hyperparameters
 # -----------------------------------------------------
 BATCH_SIZE = 64
-EPOCHS = 20
+EPOCHS = 15
 SEED = 42
-LR = 3e-4
-WEIGHT_DECAY = 1e-4
+LR = 1e-4
 
-# Path to the LBNL CSV folder and cache
 BASE_PATH = "/gpfs/workdir/fernandeda/projects/LBNL_FCU"
 CACHE_DIR = "/gpfs/workdir/fernandeda/projects/moment/data/cache"
-
-# Path to the CWRU fine-tuned checkpoint (4-class model)
 CWRU_CKPT_PATH = "checkpoints/moment_cwru_finetuned.pt"
-
-# Output checkpoint (LBNL fine-tuned model)
-LBNL_CKPT_PATH = "checkpoints/moment_lbnl_from_cwru.pt"
-
+LBNL_CKPT_PATH = "checkpoints/moment_lbnl_multichannel.pt"
+CONFUSION_MATRIX_PATH = "lbnl_confusion_matrix_multi.png"
 
 # -----------------------------------------------------
-# 1. Build LBNL dataset
+# 1. Multi-Channel Dataset
 # -----------------------------------------------------
-print("[INFO] Loading LBNL FCU dataset...")
+print("[INFO] Loading LBNL FCU dataset (Multi-Channel)...")
+
+# We use 4 variables to give the model full context
+SELECTED_COLUMNS = ['RM_TEMP', 'FCU_DAT', 'FCU_CVLV', 'FCU_HVLV']
 
 data_config = Namespace(
     base_path=BASE_PATH,
     cache_dir=CACHE_DIR,
     window=1024,
-    stride=1024,  # no temporal overlap between windows
+    stride=1024,
     seq_len=1024,
     task_name=TASKS.CLASSIFICATION,
-    sensor_column="RM_TEMP",  # you can switch to another column later
-    binary_labels=True,       # 0: fault-free (FaultFree.csv), 1: faulty (all others)
+    sensor_column=SELECTED_COLUMNS,  # Passing list of columns
+    binary_labels=True,
     load_cache=True,
 )
 
 full_dataset = LBNL_FCU_Dataset(data_config)
+print(f"[INFO] Channels: {SELECTED_COLUMNS}")
+print(f"[INFO] Input Shape: {full_dataset[0][0].shape}") # Should be (4, 1024)
 
-print(f"[INFO] LBNL dataset total samples: {len(full_dataset)}, "
-      f"num_classes: {full_dataset.num_classes}")
-
-# Reproducible splits (NOTE: this is window-level, not file-level)
 g = torch.Generator().manual_seed(SEED)
-
 total_len = len(full_dataset)
 trainval_size = int(0.85 * total_len)
 test_size = total_len - trainval_size
-
-trainval_dataset, test_dataset = random_split(
-    full_dataset, [trainval_size, test_size], generator=g
-)
+trainval_dataset, test_dataset = random_split(full_dataset, [trainval_size, test_size], generator=g)
 
 inner_train_size = int(0.85 * trainval_size)
 val_size = trainval_size - inner_train_size
-
-train_dataset, val_dataset = random_split(
-    trainval_dataset, [inner_train_size, val_size], generator=g
-)
-
-print(
-    f"[INFO] LBNL splits -> Train: {len(train_dataset)}, "
-    f"Val: {len(val_dataset)}, Test: {len(test_dataset)}"
-)
+train_dataset, val_dataset = random_split(trainval_dataset, [inner_train_size, val_size], generator=g)
 
 # -----------------------------------------------------
-# 2. DataLoaders
+# 2. Sampler (Slightly Relaxed)
 # -----------------------------------------------------
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+print("[INFO] Configuring Sampler...")
+
+train_labels_list = [train_dataset[i][1] for i in range(len(train_dataset))]
+train_labels = np.array(train_labels_list)
+class_counts = np.bincount(train_labels, minlength=full_dataset.num_classes)
+
+# Standard Inverse Frequency
+weights_np = 1.0 / (class_counts + 1e-8)
+
+# TWEAK: Reduce the weight of the minority class slightly to improve precision
+# We don't need perfect 50/50, 30/70 is often better for precision
+weights_np[0] = weights_np[0] * 0.7 
+
+sample_weights = weights_np[train_labels]
+sampler = WeightedRandomSampler(
+    weights=torch.from_numpy(sample_weights).double(),
+    num_samples=len(sample_weights),
+    replacement=True
+)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, shuffle=False)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-
 # -----------------------------------------------------
-# 3. Configure MOMENT model (binary classification)
+# 3. Model Configuration (4 Channels)
 # -----------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[INFO] Device being used: {device}")
 
 model_config = Namespace(
     task_name=TASKS.CLASSIFICATION,
-    n_channels=1,
-    num_class=full_dataset.num_classes,  # should be 2 (fault-free vs faulty)
+    n_channels=len(SELECTED_COLUMNS), # 4 Channels
+    num_class=2,
     seq_len=1024,
     patch_len=8,
     patch_stride_len=8,
@@ -104,164 +107,97 @@ model_config = Namespace(
     transformer_backbone="google/flan-t5-small",
     transformer_type="encoder_only",
     t5_config={"d_model": 256, "num_layers": 4, "num_heads": 8, "d_ff": 512},
-    randomly_initialize_backbone=False,   # we will load CWRU weights
+    randomly_initialize_backbone=False,
     freeze_embedder=False,
-    freeze_encoder=False,                 # full fine-tuning on LBNL
+    freeze_encoder=False,
     freeze_head=False,
     enable_gradient_checkpointing=True,
 )
 
 model = MOMENT(model_config).to(device)
-print(f"[INFO] MOMENT model created. Num classes: {full_dataset.num_classes}")
 
-# Sanity forward pass
-if torch.cuda.is_available():
-    dummy = torch.randn(1, 1, 1024).to(device)
-    with torch.no_grad():
-        _ = model.classify(x_enc=dummy)
-    print(f"[DEBUG] ✅ Forward pass successful on {torch.cuda.get_device_name(0)}")
-
-# -----------------------------------------------------
-# 4. Load CWRU checkpoint (encoder) and discard old head
-# -----------------------------------------------------
+# Note: CWRU checkpoint was 1-channel. We can load it, but the input projection layer
+# size will mismatch. MOMENT handles this by re-initializing the embedding layer
+# if shapes don't match, or we can strictly load only the transformer blocks.
 if os.path.exists(CWRU_CKPT_PATH):
-    print(f"[INFO] Loading CWRU checkpoint from {CWRU_CKPT_PATH}")
+    print(f"[INFO] Loading CWRU checkpoint (Transformer Body)...")
     state_dict = torch.load(CWRU_CKPT_PATH, map_location=device)
-
-    # Drop old 4-class head so we can re-initialize a 2-class head
+    
+    # Remove head AND patch_embedding (because channel count changed 1 -> 4)
     for key in list(state_dict.keys()):
-        if key.startswith("head.linear."):
-            print(f"[INFO] Dropping head parameter from checkpoint: {key}")
+        if "head" in key or "patch_embedding" in key:
             del state_dict[key]
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"[INFO] Missing keys (expected for new head): {missing}")
-    print(f"[INFO] Unexpected keys: {unexpected}")
-else:
-    print("[WARN] CWRU checkpoint not found. Training LBNL model from random init.")
+            
+    model.load_state_dict(state_dict, strict=False)
+    print("[INFO] Loaded Transformer weights. Patch Embeddings re-initialized for 4 channels.")
 
 # -----------------------------------------------------
-# 5. Loss (with class weighting) and optimizer
+# 4. Training
 # -----------------------------------------------------
-
-# Compute class weights on TRAIN subset to mitigate imbalance
-train_indices = train_dataset.indices  # indices into full_dataset
-train_labels = full_dataset.labels[train_indices]
-
-class_counts = np.bincount(train_labels, minlength=full_dataset.num_classes)
-print(f"[INFO] Train class counts: {class_counts}")
-
-# Inverse-frequency weighting: weight_c ∝ 1 / count_c
-class_weights = 1.0 / (class_counts + 1e-8)
-class_weights = class_weights / class_weights.sum() * full_dataset.num_classes
-class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
-
-print(f"[INFO] Class weights used in loss: {class_weights.cpu().numpy()}")
-
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+scaler = GradScaler(enabled=(device.type == "cuda"))
 
-use_amp = (device.type == "cuda")
-scaler = GradScaler(enabled=use_amp)
-
-os.makedirs(os.path.dirname(LBNL_CKPT_PATH), exist_ok=True)
-
-# -----------------------------------------------------
-# 6. Training + Validation
-# -----------------------------------------------------
-best_val_acc = 0.0
+best_score = 0.0 # F1 of Class 0
 
 for epoch in range(EPOCHS):
-    # ------- TRAIN -------
     model.train()
     total_loss = 0.0
-
+    
     for X, y in train_loader:
         X, y = X.to(device).float(), y.to(device)
         optimizer.zero_grad()
-
-        if use_amp:
-            with autocast():
-                outputs = model.classify(x_enc=X, input_mask=None)
-                logits = outputs.logits.squeeze()
-                loss = criterion(logits, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model.classify(x_enc=X, input_mask=None)
-            logits = outputs.logits.squeeze()
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-
+        with autocast(enabled=(device.type == "cuda")):
+            outputs = model.classify(x_enc=X)
+            loss = criterion(outputs.logits.squeeze(), y)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item()
 
     scheduler.step()
-    avg_train_loss = total_loss / len(train_loader)
-    current_lr = scheduler.get_last_lr()[0]
-
-    # ------- VALIDATION -------
+    
+    # Validation
     model.eval()
-    val_loss_total = 0.0
-    val_correct, val_total = 0, 0
-
+    all_val_preds, all_val_targets = [], []
     with torch.no_grad():
         for X, y in val_loader:
             X, y = X.to(device).float(), y.to(device)
             outputs = model.classify(x_enc=X)
-            logits = outputs.logits.squeeze()
-            v_loss = criterion(logits, y)
-            val_loss_total += v_loss.item()
+            preds = torch.argmax(outputs.logits.squeeze(), dim=1)
+            all_val_preds.extend(preds.cpu().numpy())
+            all_val_targets.extend(y.cpu().numpy())
 
-            preds = torch.argmax(logits, dim=1)
-            val_correct += (preds == y).sum().item()
-            val_total += y.size(0)
+    report = classification_report(all_val_targets, all_val_preds, output_dict=True, zero_division=0)
+    f1_class_0 = report['0']['f1-score']
+    val_acc = report['accuracy']
+    
+    print(f"[Epoch {epoch+1}] Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f} | F1 (Cls 0): {f1_class_0:.4f}")
 
-    avg_val_loss = val_loss_total / len(val_loader)
-    val_acc = 100.0 * val_correct / val_total
-
-    print(
-        f"[Epoch {epoch+1}/{EPOCHS}] "
-        f"Train loss: {avg_train_loss:.4f} | "
-        f"Val loss: {avg_val_loss:.4f} | "
-        f"Val acc: {val_acc:.2f}% | "
-        f"LR={current_lr:.6f}"
-    )
-
-    # Save best model according to validation accuracy
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
+    if f1_class_0 > best_score:
+        best_score = f1_class_0
         torch.save(model.state_dict(), LBNL_CKPT_PATH)
-        print(f"[INFO] ✅ New best model saved at epoch {epoch+1} "
-              f"(Val acc = {val_acc:.2f}%)")
+        print(f"[INFO] ✅ Saved Best Model")
 
-print(f"[INFO] Best validation accuracy achieved: {best_val_acc:.2f}%")
-
-
-# -----------------------------------------------------
-# 7. Final Test evaluation (single run)
-# -----------------------------------------------------
-# Reload best model before testing
-if os.path.exists(LBNL_CKPT_PATH):
-    state_dict = torch.load(LBNL_CKPT_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    print(f"[INFO] Loaded best LBNL model from {LBNL_CKPT_PATH} for test evaluation.")
-
+# Final Eval
+model.load_state_dict(torch.load(LBNL_CKPT_PATH, map_location=device))
 model.eval()
-test_correct, test_total = 0, 0
-
+all_test_preds, all_test_targets = [], []
 with torch.no_grad():
     for X, y in test_loader:
         X, y = X.to(device).float(), y.to(device)
         outputs = model.classify(x_enc=X)
-        logits = outputs.logits.squeeze()
-        preds = torch.argmax(logits, dim=1)
+        preds = torch.argmax(outputs.logits.squeeze(), dim=1)
+        all_test_preds.extend(preds.cpu().numpy())
+        all_test_targets.extend(y.cpu().numpy())
 
-        test_correct += (preds == y).sum().item()
-        test_total += y.size(0)
+print("\n" + "="*50)
+print(classification_report(all_test_targets, all_test_preds, target_names=['Fault-Free', 'Faulty'], digits=4))
 
-test_acc = 100.0 * test_correct / test_total
-print(f"[RESULT] ✅ Final LBNL test accuracy (fine-tuned from CWRU): {test_acc:.2f}%")
+cm = confusion_matrix(all_test_targets, all_test_preds)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Fault-Free', 'Faulty'], yticklabels=['Fault-Free', 'Faulty'])
+plt.title(f'Confusion Matrix (4-Channel)')
+plt.tight_layout()
+plt.savefig(CONFUSION_MATRIX_PATH)
