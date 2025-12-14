@@ -20,22 +20,22 @@ plt.switch_backend('Agg')
 # 0. Hyperparameters
 # -----------------------------------------------------
 BATCH_SIZE = 64
-EPOCHS = 15
+EPOCHS_WARMUP = 10  # Train only Head + Input Layer
+EPOCHS_FULL = 40    # Train everything
 SEED = 42
-LR = 1e-4
+LR_WARMUP = 1e-3    # Higher LR to learn the new input projection quickly
+LR_FULL = 1e-4      # Lower LR to preserve pre-trained knowledge
 
 BASE_PATH = "/gpfs/workdir/fernandeda/projects/LBNL_FCU"
 CACHE_DIR = "/gpfs/workdir/fernandeda/projects/moment/data/cache"
 CWRU_CKPT_PATH = "checkpoints/moment_cwru_finetuned.pt"
-LBNL_CKPT_PATH = "checkpoints/moment_lbnl_multichannel.pt"
-CONFUSION_MATRIX_PATH = "lbnl_confusion_matrix_multi.png"
+LBNL_CKPT_PATH = "checkpoints/moment_lbnl_LPFT.pt"
+CONFUSION_MATRIX_PATH = "lbnl_confusion_matrix_LPFT.png"
 
 # -----------------------------------------------------
 # 1. Multi-Channel Dataset
 # -----------------------------------------------------
 print("[INFO] Loading LBNL FCU dataset (Multi-Channel)...")
-
-# We use 4 variables to give the model full context
 SELECTED_COLUMNS = ['RM_TEMP', 'FCU_DAT', 'FCU_CVLV', 'FCU_HVLV']
 
 data_config = Namespace(
@@ -45,14 +45,11 @@ data_config = Namespace(
     stride=1024,
     seq_len=1024,
     task_name=TASKS.CLASSIFICATION,
-    sensor_column=SELECTED_COLUMNS,  # Passing list of columns
+    sensor_column=SELECTED_COLUMNS,
     binary_labels=True,
     load_cache=True,
 )
-
 full_dataset = LBNL_FCU_Dataset(data_config)
-print(f"[INFO] Channels: {SELECTED_COLUMNS}")
-print(f"[INFO] Input Shape: {full_dataset[0][0].shape}") # Should be (4, 1024)
 
 g = torch.Generator().manual_seed(SEED)
 total_len = len(full_dataset)
@@ -65,40 +62,29 @@ val_size = trainval_size - inner_train_size
 train_dataset, val_dataset = random_split(trainval_dataset, [inner_train_size, val_size], generator=g)
 
 # -----------------------------------------------------
-# 2. Sampler (Slightly Relaxed)
+# 2. Sampler (Balanced)
 # -----------------------------------------------------
 print("[INFO] Configuring Sampler...")
-
-train_labels_list = [train_dataset[i][1] for i in range(len(train_dataset))]
-train_labels = np.array(train_labels_list)
+train_labels = np.array([train_dataset[i][1] for i in range(len(train_dataset))])
 class_counts = np.bincount(train_labels, minlength=full_dataset.num_classes)
-
-# Standard Inverse Frequency
 weights_np = 1.0 / (class_counts + 1e-8)
-
-# TWEAK: Reduce the weight of the minority class slightly to improve precision
-# We don't need perfect 50/50, 30/70 is often better for precision
-weights_np[0] = weights_np[0] * 0.7 
-
+# Slight tweak to favor precision again
+weights_np[0] = weights_np[0] * 0.8 
 sample_weights = weights_np[train_labels]
-sampler = WeightedRandomSampler(
-    weights=torch.from_numpy(sample_weights).double(),
-    num_samples=len(sample_weights),
-    replacement=True
-)
+sampler = WeightedRandomSampler(torch.from_numpy(sample_weights).double(), len(sample_weights), replacement=True)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, shuffle=False)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # -----------------------------------------------------
-# 3. Model Configuration (4 Channels)
+# 3. Model Setup
 # -----------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_config = Namespace(
     task_name=TASKS.CLASSIFICATION,
-    n_channels=len(SELECTED_COLUMNS), # 4 Channels
+    n_channels=len(SELECTED_COLUMNS),
     num_class=2,
     seq_len=1024,
     patch_len=8,
@@ -113,38 +99,39 @@ model_config = Namespace(
     freeze_head=False,
     enable_gradient_checkpointing=True,
 )
-
 model = MOMENT(model_config).to(device)
 
-# Note: CWRU checkpoint was 1-channel. We can load it, but the input projection layer
-# size will mismatch. MOMENT handles this by re-initializing the embedding layer
-# if shapes don't match, or we can strictly load only the transformer blocks.
 if os.path.exists(CWRU_CKPT_PATH):
-    print(f"[INFO] Loading CWRU checkpoint (Transformer Body)...")
+    print(f"[INFO] Loading CWRU Transformer Body...")
     state_dict = torch.load(CWRU_CKPT_PATH, map_location=device)
-    
-    # Remove head AND patch_embedding (because channel count changed 1 -> 4)
     for key in list(state_dict.keys()):
         if "head" in key or "patch_embedding" in key:
             del state_dict[key]
-            
     model.load_state_dict(state_dict, strict=False)
-    print("[INFO] Loaded Transformer weights. Patch Embeddings re-initialized for 4 channels.")
 
-# -----------------------------------------------------
-# 4. Training
-# -----------------------------------------------------
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 scaler = GradScaler(enabled=(device.type == "cuda"))
+best_score = 0.0
 
-best_score = 0.0 # F1 of Class 0
+# -----------------------------------------------------
+# 4. Phase 1: WARMUP (Freeze Backbone)
+# -----------------------------------------------------
+print(f"\n[INFO] Starting PHASE 1: Warmup for {EPOCHS_WARMUP} epochs (Backbone Frozen)")
 
-for epoch in range(EPOCHS):
+# Freeze Transformer
+for param in model.parameters():
+    param.requires_grad = False
+# Unfreeze Input Layer (Patch Embedding) and Head
+for param in model.patch_embedding.parameters():
+    param.requires_grad = True
+for param in model.head.parameters():
+    param.requires_grad = True
+
+optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR_WARMUP)
+
+for epoch in range(EPOCHS_WARMUP):
     model.train()
     total_loss = 0.0
-    
     for X, y in train_loader:
         X, y = X.to(device).float(), y.to(device)
         optimizer.zero_grad()
@@ -155,9 +142,38 @@ for epoch in range(EPOCHS):
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item()
-
-    scheduler.step()
     
+    # Validation (Optional during warmup, but good to see progress)
+    print(f"[Warmup {epoch+1}/{EPOCHS_WARMUP}] Loss: {total_loss/len(train_loader):.4f}")
+
+# -----------------------------------------------------
+# 5. Phase 2: FULL TRAINING (Unfreeze All)
+# -----------------------------------------------------
+print(f"\n[INFO] Starting PHASE 2: Full Finetuning for {EPOCHS_FULL} epochs (Unfrozen)")
+
+# Unfreeze Everything
+for param in model.parameters():
+    param.requires_grad = True
+
+optimizer = optim.AdamW(model.parameters(), lr=LR_FULL, weight_decay=1e-3)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_FULL)
+
+for epoch in range(EPOCHS_FULL):
+    model.train()
+    total_loss = 0.0
+    for X, y in train_loader:
+        X, y = X.to(device).float(), y.to(device)
+        optimizer.zero_grad()
+        with autocast(enabled=(device.type == "cuda")):
+            outputs = model.classify(x_enc=X)
+            loss = criterion(outputs.logits.squeeze(), y)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item()
+    
+    scheduler.step()
+
     # Validation
     model.eval()
     all_val_preds, all_val_targets = [], []
@@ -173,15 +189,19 @@ for epoch in range(EPOCHS):
     f1_class_0 = report['0']['f1-score']
     val_acc = report['accuracy']
     
-    print(f"[Epoch {epoch+1}] Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f} | F1 (Cls 0): {f1_class_0:.4f}")
+    print(f"[Epoch {epoch+1}/{EPOCHS_FULL}] Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f} | F1 (Cls 0): {f1_class_0:.4f}")
 
     if f1_class_0 > best_score:
         best_score = f1_class_0
         torch.save(model.state_dict(), LBNL_CKPT_PATH)
-        print(f"[INFO] ✅ Saved Best Model")
+        print(f"[INFO] ✅ Saved Best Model (F1: {best_score:.4f})")
 
-# Final Eval
-model.load_state_dict(torch.load(LBNL_CKPT_PATH, map_location=device))
+# -----------------------------------------------------
+# 6. Final Evaluation
+# -----------------------------------------------------
+if os.path.exists(LBNL_CKPT_PATH):
+    model.load_state_dict(torch.load(LBNL_CKPT_PATH, map_location=device))
+
 model.eval()
 all_test_preds, all_test_targets = [], []
 with torch.no_grad():
@@ -198,6 +218,6 @@ print(classification_report(all_test_targets, all_test_preds, target_names=['Fau
 cm = confusion_matrix(all_test_targets, all_test_preds)
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Fault-Free', 'Faulty'], yticklabels=['Fault-Free', 'Faulty'])
-plt.title(f'Confusion Matrix (4-Channel)')
+plt.title(f'Confusion Matrix (LP-FT Strategy)')
 plt.tight_layout()
 plt.savefig(CONFUSION_MATRIX_PATH)

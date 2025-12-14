@@ -36,5 +36,5 @@ print("[DEBUG PY] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES")
 EOF
 
 # python -u scripts/eval_lbnl_fcu.py
-python -u scripts/train_lbnl_fcu_from_cwru.py
-
+# python -u scripts/train_lbnl_fcu_from_cwru.py
+python -u scripts/train_lbnl_scratch.py
